@@ -1,21 +1,14 @@
 import os
 import logging
-import subprocess
-import asyncio
-import re
+import tempfile
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    CallbackQueryHandler
-)
-from pytube import YouTube, exceptions
+import yt_dlp
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from pydub import AudioSegment
+import requests
 
 # Настройка логирования
 logging.basicConfig(
@@ -24,178 +17,203 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Токен бота (ЗАМЕНИТЕ НА СВОЙ!)
-TOKEN = "8431111353:AAFjJn1Pq7m4d6TWqCiQnlhVmJbEpHp1_4s"
+# Конфигурация
+TOKEN = os.getenv('8431111353:AAFjJn1Pq7m4d6TWqCiQnlhVmJbEpHp1_4s')
+if not TOKEN:
+    raise ValueError("Не установлен TELEGRAM_BOT_TOKEN")
 
-# Папки
-TEMP_DIR = "temp_audio"
-os.makedirs(TEMP_DIR, exist_ok=True)
+# Папка для временных файлов
+TEMP_DIR = Path(tempfile.gettempdir()) / "youtube_audio_bot"
+TEMP_DIR.mkdir(exist_ok=True)
 
-# Поиск FFmpeg
-def find_ffmpeg() -> Optional[str]:
-    paths = [
-        "ffmpeg", "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg",
-        "C:\\ffmpeg\\bin\\ffmpeg.exe", "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
-        "C:\\Program Files (x86)\\ffmpeg\\bin\\ffmpeg.exe", "ffmpeg.exe"
-    ]
-    for path in paths:
+class YouTubeAudioConverter:
+    """Класс для конвертации YouTube видео в аудио"""
+    
+    @staticmethod
+    def get_video_info(url: str) -> Optional[dict]:
+        """Получение информации о видео"""
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
         try:
-            subprocess.run([path, "-version"], capture_output=True, check=True, timeout=2)
-            logger.info(f"FFmpeg найден: {path}")
-            return path
-        except:
-            continue
-    return None
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                return {
+                    'title': info.get('title', 'Без названия'),
+                    'duration': info.get('duration', 0),
+                    'uploader': info.get('uploader', 'Неизвестно'),
+                }
+        except Exception as e:
+            logger.error(f"Ошибка получения информации: {e}")
+            return None
+    
+    @staticmethod
+    def download_audio(url: str) -> Optional[Path]:
+        """Скачивание аудио с YouTube"""
+        try:
+            # Опции для скачивания только аудио
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': str(TEMP_DIR / '%(title)s.%(ext)s'),
+                'quiet': True,
+                'no_warnings': True,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                audio_file = ydl.prepare_filename(info)
+                
+                # Преобразуем в mp3 если нужно
+                if not audio_file.endswith('.mp3'):
+                    audio_file = os.path.splitext(audio_file)[0] + '.mp3'
+                
+                return Path(audio_file)
+                
+        except Exception as e:
+            logger.error(f"Ошибка скачивания: {e}")
+            return None
 
-FFMPEG_PATH = find_ffmpeg()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    welcome_text = (
+        "👋 Привет! Я бот для конвертации YouTube видео в аудио.\n\n"
+        "Просто отправь мне ссылку на YouTube видео, и я пришлю тебе аудиофайл.\n\n"
+        "⚠️ Ограничения:\n"
+        "- Максимальная длительность: 30 минут\n"
+        "- Только публичные видео\n"
+        "- Формат вывода: MP3"
+    )
+    await update.message.reply_text(welcome_text)
 
-# Проверка YouTube URL
-def is_youtube_url(url: str) -> bool:
-    patterns = [
-        r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})',
-        r'^https?://(?:www\.)?youtube\.com/watch\?v=[\w-]{11}',
-        r'^https?://youtu\.be/[\w-]{11}'
-    ]
-    return any(re.match(pattern, url) for pattern in patterns)
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
+    help_text = (
+        "📖 Как пользоваться ботом:\n\n"
+        "1. Отправьте ссылку на YouTube видео\n"
+        "2. Бот скачает и преобразует видео в аудио\n"
+        "3. Вы получите MP3 файл\n\n"
+        "Примеры ссылок:\n"
+        "- https://www.youtube.com/watch?v=...\n"
+        "- https://youtu.be/...\n"
+        "- https://youtube.com/shorts/...\n\n"
+        "Команды:\n"
+        "/start - Начало работы\n"
+        "/help - Эта справка"
+    )
+    await update.message.reply_text(help_text)
 
-# Скачивание и конвертация
-async def download_youtube_audio(url: str, chat_id: str) -> Tuple[Optional[str], Optional[str]]:
+async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик YouTube ссылок"""
+    url = update.message.text.strip()
+    
+    # Проверка на валидную YouTube ссылку
+    if not any(domain in url for domain in ['youtube.com', 'youtu.be']):
+        await update.message.reply_text("❌ Пожалуйста, отправьте валидную ссылку на YouTube.")
+        return
+    
+    # Отправляем сообщение о начале обработки
+    processing_msg = await update.message.reply_text("⏳ Обрабатываю ссылку...")
+    
     try:
-        yt = YouTube(url)
-        title = yt.title
-        duration = yt.length
+        # Получаем информацию о видео
+        video_info = YouTubeAudioConverter.get_video_info(url)
         
-        if duration > 7200:
-            raise Exception("Видео слишком длинное (максимум 2 часа)")
+        if not video_info:
+            await processing_msg.edit_text("❌ Не удалось получить информацию о видео. Проверьте ссылку.")
+            return
         
-        audio_stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
-        if not audio_stream:
-            raise Exception("Аудио поток не найден")
+        # Проверяем длительность (макс 30 минут)
+        if video_info['duration'] > 1800:  # 30 минут в секундах
+            await processing_msg.edit_text(
+                "❌ Видео слишком длинное (более 30 минут).\n"
+                "Пожалуйста, отправьте видео покороче."
+            )
+            return
         
-        logger.info(f"Скачивание: {title}")
-        download_path = audio_stream.download(
-            output_path=TEMP_DIR,
-            filename_prefix=f"{chat_id}_",
-            skip_existing=False
+        # Обновляем статус
+        await processing_msg.edit_text(
+            f"🎵 Название: {video_info['title']}\n"
+            f"👤 Автор: {video_info['uploader']}\n"
+            f"⏱ Длительность: {video_info['duration'] // 60} мин\n\n"
+            "⬇️ Скачиваю аудио..."
         )
         
-        mp3_path = os.path.splitext(download_path)[0] + ".mp3"
+        # Скачиваем аудио
+        audio_path = YouTubeAudioConverter.download_audio(url)
         
-        if not FFMPEG_PATH:
-            raise Exception("FFmpeg не найден. Установите FFmpeg и добавьте в PATH")
+        if not audio_path or not audio_path.exists():
+            await processing_msg.edit_text("❌ Не удалось скачать аудио. Попробуйте другую ссылку.")
+            return
         
-        cmd = [
-            FFMPEG_PATH, '-i', download_path,
-            '-acodec', 'libmp3lame', '-ab', '128k',
-            '-ac', '2', '-ar', '44100', '-vn', '-y', mp3_path
-        ]
+        # Отправляем аудиофайл
+        await processing_msg.edit_text("📤 Отправляю аудиофайл...")
         
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
+        with open(audio_path, 'rb') as audio_file:
+            await update.message.reply_audio(
+                audio=audio_file,
+                title=video_info['title'][:64],  # Ограничение Telegram
+                performer=video_info['uploader'][:64],
+                caption=f"🎵 {video_info['title']}"
+            )
         
-        if process.returncode != 0:
-            raise Exception(f"Ошибка конвертации: {stderr.decode()[:100]}")
+        await processing_msg.edit_text("✅ Готово! Аудио отправлено.")
         
+        # Удаляем временный файл
         try:
-            os.remove(download_path)
+            audio_path.unlink()
         except:
             pass
-        
-        return mp3_path, title
-        
-    except exceptions.PytubeError as e:
-        raise Exception(f"Ошибка YouTube: {str(e)}")
+            
     except Exception as e:
-        raise Exception(f"Ошибка обработки: {str(e)}")
+        logger.error(f"Ошибка обработки: {e}")
+        try:
+            await processing_msg.edit_text(f"❌ Произошла ошибка: {str(e)[:200]}")
+        except:
+            await update.message.reply_text("❌ Произошла неизвестная ошибка.")
 
-# Команда /start
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome = """
-🎵 *YouTube Audio Bot*
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Ошибка при обработке обновления: {context.error}")
+    
+    try:
+        await update.message.reply_text(
+            "❌ Произошла ошибка при обработке запроса.\n"
+            "Пожалуйста, попробуйте позже."
+        )
+    except:
+        pass
 
-*Привет! Я конвертирую YouTube видео в аудио.*
-
-📋 *Как использовать:*
-1. Отправьте ссылку на YouTube видео
-2. Я скачаю аудио и отправлю вам MP3 файл
-
-⚠️ *Внимание:*
-- Максимальная длительность: 2 часа
-- Качество: 128kbps MP3
-- Только для личного использования
-
-Для помощи: /help
-    """
-    keyboard = [
-        [InlineKeyboardButton("📖 Помощь", callback_data="help")],
-        [InlineKeyboardButton("⚙️ Проверить FFmpeg", callback_data="check_ffmpeg")]
-    ]
-    await update.message.reply_text(
-        welcome,
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup(keyboard)
+def main():
+    """Основная функция запуска бота"""
+    # Создаем приложение
+    application = Application.builder().token(TOKEN).build()
+    
+    # Регистрируем обработчики
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, 
+        handle_youtube_link
+    ))
+    
+    # Обработчик ошибок
+    application.add_error_handler(error_handler)
+    
+    # Запускаем бота
+    logger.info("Бот запущен...")
+    
+    # Для Railway используем polling с обработкой shutdown
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
     )
 
-# Команда /help
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """
-📖 *Справка*
-
-*Основные команды:*
-/start - Начало работы
-/help - Эта справка
-/ffmpeg - Проверить FFmpeg
-/about - О боте
-
-*Как конвертировать:*
-1. Отправьте ссылку на YouTube
-2. Ждите обработки
-3. Получите MP3 файл
-
-*Примеры ссылок:*
-• https://www.youtube.com/watch?v=dQw4w9WgXcQ
-• https://youtu.be/dQw4w9WgXcQ
-
-*Если проблемы:*
-1. Проверьте корректность ссылки
-2. Убедитесь, что видео не длиннее 2 часов
-3. Проверьте FFmpeg (/ffmpeg)
-    """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
-
-# Команда /ffmpeg
-async def ffmpeg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if FFMPEG_PATH:
-        try:
-            result = subprocess.run(
-                [FFMPEG_PATH, "-version"],
-                capture_output=True, text=True, timeout=2
-            )
-            version = result.stdout.split('\n')[0].split(' ')[2] if result.stdout else "неизвестна"
-            await update.message.reply_text(
-                f"✅ FFmpeg установлен!\n📍 Путь: `{FFMPEG_PATH}`\n📦 Версия: `{version}`",
-                parse_mode='Markdown'
-            )
-        except:
-            await update.message.reply_text(
-                f"✅ FFmpeg найден: `{FFMPEG_PATH}`",
-                parse_mode='Markdown'
-            )
-    else:
-        instructions = """
-❌ FFmpeg не найден!
-
-*Установка FFmpeg:*
-
-*Windows:*
-1. Скачайте с https://ffmpeg.org/download.html
-2. Распакуйте в C:\\ffmpeg\\
-3. Добавьте C:\\ffmpeg\\bin\\ в PATH
-4. Перезапустите бота
-
-*Ubuntu/Debian:*
-```bash
-sudo apt update
-sudo apt install ffmpeg"""
+if __name__ == '__main__':
+    main()
